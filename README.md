@@ -6,6 +6,7 @@ Cobra; the same firmware and app are meant to grow into a universal gauge kit.
 
 - **App:** [gauge_app](https://github.com/goneflyin2002/gauge_app) (Flutter, Android)
 - **Current version:** 0.6.0
+- **Installing in a car:** see [INSTALL.md](INSTALL.md)
 
 ---
 
@@ -135,11 +136,6 @@ The first OTA-capable firmware (0.5.0) has to be flashed over USB once.
 | 0.5.1 | OTA test release. |
 | 0.5.0 | Firmware updates over Bluetooth from the app. |
 | 0.4.1 | USB serial can no longer stall the gauge (fixed slow nudges). |
-| 0.4.0 | Bluetooth setup service for the app. |
-| 0.3.0 | TB6612FNG drive at 5 V. |
-| 0.2.0 | X27 gauge stepper, sine microstepping, homing against the stop. |
-| 0.1.0 | First prototype (NEMA 8 + TMC2209, hall-sensor homing). |
-
 | 0.4.0 | Bluetooth setup service for the app. |
 | 0.3.0 | TB6612FNG drive at 5 V. |
 | 0.2.0 | X27 gauge stepper, sine microstepping, homing against the stop. |
