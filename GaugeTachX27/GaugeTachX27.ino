@@ -31,7 +31,7 @@
 #include <BLE2902.h>          // NimBLE (ESP32-C5) adds this descriptor automatically
 #endif
 
-#define FW_VERSION "0.5.0"
+#define FW_VERSION "0.6.0"
 // Releases: bump FW_VERSION, Sketch > Export Compiled Binary, publish the .bin
 // and version.json in the GaugeTachFirmware repo (see its README).
 // Tools > Partition Scheme must stay "8M with spiffs (3MB APP/1.5MB SPIFFS)":
@@ -52,6 +52,7 @@ constexpr uint8_t PIN_M4   = 12;  // D7  -> X27 pin 4 |  BIN2
 // TB6612: PWMA, PWMB, STBY and VCC to 3.3 V; VM to 5 V; GND common.
 //         AO1 -> X27 pin 1, AO2 -> pin 2, BO1 -> pin 3, BO2 -> pin 4.
 constexpr uint8_t PIN_TACH = 10;  // D10 <- optocoupler output (falling edge = spark)
+constexpr uint8_t PIN_IGN  = 9;   // D9  <- ignition sense: 12 V via 2.2k / 560 divider (HIGH = key on)
 // Free: D4/D5 (I2C), D8, D9.  D2/D3 are strapping pins - leave unused.
 
 // ------------------------------------------------------------------
@@ -90,6 +91,8 @@ struct Config {
   float    deadbandDeg;
   uint8_t  drivePct;          // coil drive strength, 100 = full 3.3 V
   uint8_t  invertDir;
+  uint8_t  ignSense;          // 1 = park needle at 0 when ignition power drops (D9)
+                              // (sits in padding, so saved configs still load; old ones read 0 = off)
 
   // Homing against the mechanical stop
   float    zeroOffsetDeg;     // the 0 mark is this far ABOVE the stop
@@ -342,6 +345,8 @@ void stopBlocking() {
 // ------------------------------------------------------------------
 volatile bool homed = false;
 volatile bool busy  = false;        // homing / sweeping (shown in the app)
+volatile bool ignOn  = true;        // debounced ignition sense (D9)
+volatile bool parked = false;       // ignition off: needle sent to 0, input ignored
 
 // Drive downscale at a constant speed for a set distance (needle may sit on the stop part of it).
 void driveDown(float dps, float distDeg) {
@@ -472,7 +477,7 @@ void gaugeUpdate() {
   rpmFilt += a * (rpmRaw - rpmFilt);
   if (rpmRaw == 0 && rpmFilt < 5) rpmFilt = 0;
 
-  if (!homed || manualHold) return;
+  if (!homed || manualHold || parked) return;
   float deg = constrain(valueToDeg(rpmFilt), 0.0f, cfg.sweepDeg);
   if (mMode != MoveMode::Position || fabsf(deg - mTarget) >= cfg.deadbandDeg ||
       (deg == 0 && mTarget != 0)) setTarget(deg);
@@ -519,6 +524,7 @@ void printHelp() {
     "  motor off | motor on  de-energize / re-energize coils\n"
     "  set <key> <value>     keys: sweep max ppr maxrpm filter speed accel deadband\n"
     "                              drive invert zerooffset homespeed overtravel wake\n"
+    "                              ign (1 = park needle when ignition turns off)\n"
     "  cal clear | cal add <rpm> <deg> | cal show\n"
     "  save | defaults\n"));
 }
@@ -558,6 +564,7 @@ void handleSet(const char* key, float v) {
   else if (!strcmp(key, "homespeed")) cfg.homeSpeedDps  = constrain(v, 20.0f, 600.0f);
   else if (!strcmp(key, "overtravel")) cfg.overtravelDeg = constrain(v, 0.0f, 60.0f);
   else if (!strcmp(key, "wake"))      cfg.wakeSweep = v != 0;
+  else if (!strcmp(key, "ign"))       cfg.ignSense = v != 0;
   else { Serial.println(F("Unknown key.")); return; }
 
   applyConfig();
@@ -766,20 +773,35 @@ void publishConfig() {
     "{\"fw\":\"%s\",\"type\":\"tach\",\"driver\":\"%s\",\"rev\":%lu,"
     "\"sweep\":%.1f,\"ppr\":%.2f,\"maxrpm\":%.0f,\"filter\":%.0f,"
     "\"speed\":%.0f,\"accel\":%.0f,\"deadband\":%.2f,\"drive\":%u,\"invert\":%u,"
-    "\"zerooffset\":%.2f,\"homespeed\":%.0f,\"overtravel\":%.0f,\"wake\":%u,\"cal\":[",
+    "\"zerooffset\":%.2f,\"homespeed\":%.0f,\"overtravel\":%.0f,\"wake\":%u,\"ign\":%u,\"cal\":[",
     FW_VERSION, USE_TB6612 ? "tb6612" : "gpio", (unsigned long)cfgRev,
     cfg.sweepDeg, cfg.pulsesPerRev, cfg.maxInputRpm, cfg.filterMs,
     cfg.maxSpeedDps, cfg.accelDps2, cfg.deadbandDeg, cfg.drivePct, cfg.invertDir,
-    cfg.zeroOffsetDeg, cfg.homeSpeedDps, cfg.overtravelDeg, cfg.wakeSweep);
+    cfg.zeroOffsetDeg, cfg.homeSpeedDps, cfg.overtravelDeg, cfg.wakeSweep, cfg.ignSense);
   for (uint8_t i = 0; i < cfg.calN && n < (int)sizeof(b) - 40; i++)
     n += snprintf(b + n, sizeof(b) - n, "%s[%.0f,%.2f]", i ? "," : "", cfg.calVal[i], cfg.calDeg[i]);
   n += snprintf(b + n, sizeof(b) - n, "]}");
   cfgChar->setValue((uint8_t*)b, n);
 }
 
+// While parked the coils may be off, so anything that moves the needle would
+// lose track of where it is. Those commands wait until the ignition is back on.
+bool isMotionCommand(const char* line) {
+  static const char* const motion[] = { "home", "sweep", "goto", "jog", "setzero", "motor", "rpm", "defaults" };
+  for (const char* m : motion) {
+    size_t n = strlen(m);
+    if (strncmp(line, m, n) == 0 && (line[n] == 0 || line[n] == ' ')) return true;
+  }
+  return strncmp(line, "set invert", 10) == 0 || strncmp(line, "set zerooffset", 14) == 0;
+}
+
 // Every command (serial or BLE) goes through here, so the app always
 // sees settings changes no matter where they came from.
 void processCommand(char* line) {
+  if (parked && isMotionCommand(line)) {
+    Serial.println(F("Ignition is off - needle parked. Turn the key on first."));
+    return;
+  }
   static Config before;
   memcpy(&before, &cfg, sizeof(cfg));
   handleLine(line);
@@ -798,10 +820,11 @@ void bleStatusTask(void*) {
     unsigned otaPct = otaSize ? (unsigned)((uint64_t)otaRecv * 100 / otaSize) : 0;
     int n = snprintf(b, sizeof(b),
       "{\"rpm\":%.0f,\"raw\":%.0f,\"needle\":%.2f,\"target\":%.2f,\"homed\":%u,\"busy\":%u,"
-      "\"hold\":%u,\"sim\":%d,\"unsaved\":%u,\"rev\":%lu,\"ota\":%u,\"otapct\":%u,\"otaerr\":\"%s\"}",
+      "\"hold\":%u,\"sim\":%d,\"unsaved\":%u,\"rev\":%lu,\"ota\":%u,\"otapct\":%u,\"otaerr\":\"%s\","
+      "\"ignon\":%u,\"parked\":%u}",
       (float)rpmFilt, (float)rpmRaw, (float)mPos, (float)mTarget, homed ? 1 : 0, busy ? 1 : 0,
       manualHold ? 1 : 0, simRpm >= 0 ? (int)simRpm : -1, cfgUnsaved ? 1 : 0, (unsigned long)cfgRev,
-      (unsigned)otaState, otaPct, otaErr);
+      (unsigned)otaState, otaPct, otaErr, ignOn ? 1 : 0, parked ? 1 : 0);
     statusChar->setValue((uint8_t*)b, n);
     statusChar->notify();
   }
@@ -851,6 +874,76 @@ void pollBle() {
 }
 
 // ------------------------------------------------------------------
+//  Ignition sense: park the needle when the key is turned off
+//
+//  D9 sees ~2.4-2.9 V with the key on (12-14.4 V through 2.2k / 560) and
+//  0 V with it off. The supercap keeps the gauge alive for a few seconds,
+//  long enough to drive the needle home and switch the coils off.
+//
+//  To avoid parking by mistake (battery sag while cranking can pull D9
+//  below the logic threshold), it parks only when D9 has been LOW for
+//  100 ms AND no spark has arrived for 100 ms. With the key off there's no
+//  spark, so this costs nothing; with the engine running it can't trigger.
+// ------------------------------------------------------------------
+constexpr uint32_t IGN_OFF_MS      = 100;   // D9 low this long = key off
+constexpr uint32_t IGN_ON_MS       = 300;   // D9 high this long = key back on
+constexpr uint32_t IGN_QUIET_US    = 100000;// no spark for 100 ms
+constexpr uint32_t PARK_TIMEOUT_MS = 4000;  // coils off by now, no matter what
+
+uint32_t parkStartMs = 0;
+bool     parkCoilsOff = false;
+
+void parkNeedle() {
+  parked = true;
+  parkCoilsOff = false;
+  parkStartMs = millis();
+  simRpm = -1;
+  manualHold = false;
+  setTarget(0);                                  // at the normal speed / accel (no lost steps)
+  Serial.println(F("Ignition off: parking needle."));
+}
+
+void unparkNeedle() {
+  bool lostTrack = parkCoilsOff && !homed;
+  coilsEnabled = true;                           // same coil phase as when switched off,
+  parked = false;                                // so the needle doesn't move
+  parkCoilsOff = false;
+  Serial.println(F("Ignition on."));
+  if (lostTrack) homeNeedle();
+}
+
+void ignitionUpdate() {
+  static uint32_t lastHighMs = 0, lastLowMs = 0;
+  uint32_t now = millis();
+  if (digitalRead(PIN_IGN) == HIGH) lastHighMs = now; else lastLowMs = now;
+  if (ignOn  && now - lastHighMs >= IGN_OFF_MS) ignOn = false;
+  if (!ignOn && now - lastLowMs  >= IGN_ON_MS)  ignOn = true;
+
+  if (!cfg.ignSense) {                           // feature switched off in the app
+    if (parked) unparkNeedle();
+    return;
+  }
+
+  if (!parked) {
+    bool sparkQuiet = (uint32_t)(micros() - t_lastUs) > IGN_QUIET_US;
+    if (!ignOn && sparkQuiet && homed && !busy && otaState == 0) parkNeedle();
+    return;
+  }
+
+  // Parked
+  if (ignOn) { unparkNeedle(); return; }
+  if (!parkCoilsOff) {
+    bool atZero = settled() && mPos == 0;
+    if (atZero || millis() - parkStartMs > PARK_TIMEOUT_MS) {
+      if (!atZero) homed = false;                // didn't make it: re-home next key-on
+      coilsEnabled = false;                      // save the supercap
+      parkCoilsOff = true;
+      Serial.println(atZero ? F("Needle parked, coils off.") : F("Park timed out, coils off."));
+    }
+  }
+}
+
+// ------------------------------------------------------------------
 void setup() {
   Serial.begin(115200);
 #if ARDUINO_USB_MODE && ARDUINO_USB_CDC_ON_BOOT
@@ -875,6 +968,7 @@ void setup() {
   }
 
   pinMode(PIN_TACH, INPUT_PULLUP);
+  pinMode(PIN_IGN, INPUT_PULLDOWN);              // unwired = "ignition off"
   attachInterrupt(digitalPinToInterrupt(PIN_TACH), onTachEdge, FALLING);
 
   coilsEnabled = true;
@@ -894,6 +988,7 @@ void loop() {
   gaugeUpdate();
   pollSerial();
   pollBle();
+  ignitionUpdate();
   printMonitor();
   if (otaState == 2 && (int32_t)(millis() - otaRebootAt) >= 0) {
     Serial.println(F("Firmware updated, restarting."));
