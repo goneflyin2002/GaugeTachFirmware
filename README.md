@@ -4,8 +4,8 @@ Stepper-driven needle gauge for classic cars, set up from a phone over
 Bluetooth. The first gauge is a 0–7000 RPM tachometer with a 345° sweep for a
 Cobra; the same firmware and app are meant to grow into a universal gauge kit.
 
-- **App:** [GaugeTachApp](https://github.com/goneflyin2002/GaugeTachApp) (Flutter, Android)
-- **Current version:** 0.5.0
+- **App:** [gauge_app](https://github.com/goneflyin2002/gauge_app) (Flutter, Android)
+- **Current version:** 0.6.0
 
 ---
 
@@ -35,6 +35,15 @@ Cobra; the same firmware and app are meant to grow into a universal gauge kit.
 PC817 LED, with a 1N4148 reverse-parallel across the LED. The PC817 output
 pulls D10 low on each spark (internal pull-up, or add 4.7–10 kΩ to 3.3 V).
 Never connect coil negative directly to the board.
+
+**Ignition sense (D9, optional):** 12 V ignition (switched) → 2.2 kΩ → D9,
+with 560 Ω from D9 to ground (about 2.4–2.9 V at D9 with the key on). A
+100 nF capacitor across the 560 Ω filters noise. With "Park needle when
+ignition turns off" enabled in the app, turning the key off drives the needle
+to 0 and switches the coils off while the supercapacitor keeps the gauge
+alive. It only parks once sparks have stopped too, so battery sag while
+cranking can't trigger it. Use an ignition feed that stays on in START if you
+can.
 
 To drive the X27 straight from the GPIO pins instead (3.3 V, less torque),
 set `USE_TB6612 = false` at the top of the sketch.
@@ -74,7 +83,7 @@ the app can.
 | `goto <deg>` / `jog <deg>` | Hold the needle at / nudge it by an angle |
 | `setzero` | The needle is on the 0 mark now: store it |
 | `motor off` / `motor on` | De-energize / re-energize the coils |
-| `set <key> <value>` | `sweep max ppr maxrpm filter speed accel deadband drive invert zerooffset homespeed overtravel wake` |
+| `set <key> <value>` | `sweep max ppr maxrpm filter speed accel deadband drive invert zerooffset homespeed overtravel wake ign` |
 | `cal clear` / `cal add <rpm> <deg>` | Non-linear dial calibration (up to 8 points) |
 | `save` / `defaults` | Store settings in flash / load defaults (not saved) |
 
@@ -90,7 +99,7 @@ UUIDs are `6a1f000x-3c2d-4b8e-9f10-7e5a2c9d4b01`:
 | 1 | Service | GaugeTach |
 | 2 | Read | JSON of all settings, plus `fw` and `rev` |
 | 3 | Write | Text commands from the table above, one per line |
-| 4 | Notify | Live JSON 10×/s: `rpm raw needle target homed busy hold sim unsaved rev ota otapct otaerr` |
+| 4 | Notify | Live JSON 10×/s: `rpm raw needle target homed busy hold sim unsaved rev ota otapct otaerr ignon parked` |
 | 5 | Write | OTA control: `begin <bytes>`, `end`, `abort` |
 | 6 | Write | OTA data: raw firmware chunks, in order |
 
@@ -122,8 +131,15 @@ The first OTA-capable firmware (0.5.0) has to be flashed over USB once.
 
 | Version | Summary |
 |---|---|
+| 0.6.0 | Ignition sense on D9: needle parks at 0 when the key is turned off (switch in the app). |
+| 0.5.1 | OTA test release. |
 | 0.5.0 | Firmware updates over Bluetooth from the app. |
 | 0.4.1 | USB serial can no longer stall the gauge (fixed slow nudges). |
+| 0.4.0 | Bluetooth setup service for the app. |
+| 0.3.0 | TB6612FNG drive at 5 V. |
+| 0.2.0 | X27 gauge stepper, sine microstepping, homing against the stop. |
+| 0.1.0 | First prototype (NEMA 8 + TMC2209, hall-sensor homing). |
+
 | 0.4.0 | Bluetooth setup service for the app. |
 | 0.3.0 | TB6612FNG drive at 5 V. |
 | 0.2.0 | X27 gauge stepper, sine microstepping, homing against the stop. |
