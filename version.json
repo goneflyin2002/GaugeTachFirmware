@@ -1,6 +1,6 @@
 {
-  "version": "0.6.0",
-  "url": "https://raw.githubusercontent.com/goneflyin2002/GaugeTachFirmware/main/releases/GaugeTach_v0.6.0.bin",
-  "size": 878368,
-  "notes": "Ignition sense on D9: needle parks at 0 when the key is turned off. Turn it on in Setup > Ignition."
+  "version": "0.7.0",
+  "url": "https://raw.githubusercontent.com/goneflyin2002/GaugeTachFirmware/main/releases/GaugeTach_v0.7.0.bin",
+  "size": 882656,
+  "notes": "Added multilayer glitch filters."
 }
