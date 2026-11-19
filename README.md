@@ -5,7 +5,7 @@ Bluetooth. The first gauge is a 0–7000 RPM tachometer with a 345° sweep for a
 Cobra; the same firmware and app are meant to grow into a universal gauge kit.
 
 - **App:** [gauge_app](https://github.com/goneflyin2002/gauge_app) (Flutter, Android)
-- **Current version:** 0.6.0
+- **Current version:** 0.7.1
 - **Installing in a car:** see [INSTALL.md](INSTALL.md)
 
 ---
@@ -34,8 +34,20 @@ Cobra; the same firmware and app are meant to grow into a universal gauge kit.
 
 **Tach input (D10):** coil negative → 10 kΩ 1 W → 18 V zener to ground → 1 kΩ →
 PC817 LED, with a 1N4148 reverse-parallel across the LED. The PC817 output
-pulls D10 low on each spark (internal pull-up, or add 4.7–10 kΩ to 3.3 V).
+pulls D10 low on each spark. At D10: a **4.7 kΩ pull-up to 3.3 V** and a
+**2.2 nF capacitor to GND**, both right at the pin, with **no series
+resistor** (it would stop the PC817 pulling D10 cleanly low). The capacitor
+stops edge ringing and interference from being counted as pulses.
 Never connect coil negative directly to the board.
+
+The firmware adds more layers on top: a check that each edge settles LOW
+(sampled every 20 µs for up to 100 µs), a max-RPM lockout, rejection of
+intervals far shorter than the recent typical one, treating a ~2× interval as
+a missed pulse, and a reading that ignores the 2 highest and 2 lowest of the
+last 8 intervals. The ESP32-C5's hardware glitch filter is available but off
+(it dropped real edges from the optocoupler in 0.7.0). Rejected
+pulses are counted (`tach`, and in the app's Live tab) so you can see whether
+noise is getting in.
 
 **Ignition sense (D9, optional):** 12 V ignition (switched) → 2.2 kΩ → D9,
 with 560 Ω from D9 to ground (about 2.4–2.9 V at D9 with the key on). A
@@ -77,7 +89,9 @@ the app can.
 | Command | Does |
 |---|---|
 | `show` | Print all settings |
-| `mon` | Toggle live readout |
+| `mon` | Toggle live readout (includes the rejected-pulse count) |
+| `tach` / `tach reset` | Tach edge count, rejects by type, layer states / clear counters |
+| `tach hw\|confirm\|adaptive on\|off` | Switch a tach filter layer for testing (not saved) |
 | `rpm <n>` / `live` | Simulate an input / back to the real signal |
 | `sweep [n]` | Sweep 0 → full → 0, n times |
 | `home` | Re-zero against the stop |
@@ -100,7 +114,7 @@ UUIDs are `6a1f000x-3c2d-4b8e-9f10-7e5a2c9d4b01`:
 | 1 | Service | GaugeTach |
 | 2 | Read | JSON of all settings, plus `fw` and `rev` |
 | 3 | Write | Text commands from the table above, one per line |
-| 4 | Notify | Live JSON 10×/s: `rpm raw needle target homed busy hold sim unsaved rev ota otapct otaerr ignon parked` |
+| 4 | Notify | Live JSON 10×/s: `rpm raw needle target homed busy hold sim unsaved rev ota otapct otaerr ignon parked rej` |
 | 5 | Write | OTA control: `begin <bytes>`, `end`, `abort` |
 | 6 | Write | OTA data: raw firmware chunks, in order |
 
@@ -132,6 +146,8 @@ The first OTA-capable firmware (0.5.0) has to be flashed over USB once.
 
 | Version | Summary |
 |---|---|
+| 0.7.1 | Fixes 0.7.0 tach dropouts: hardware glitch filter off by default, edge check samples up to 100 µs (slow optocoupler edges pass), missed pulses no longer dip the needle, layer on/off switches and edges/s in `mon`. |
+| 0.7.0 | Tach input noise protection: hardware glitch filter, edge confirmation, adaptive interval rejection, trimmed 2-revolution reading, noise counters. Fixes erratic readings from edge ringing at low RPM. |
 | 0.6.0 | Ignition sense on D9: needle parks at 0 when the key is turned off (switch in the app). |
 | 0.5.1 | OTA test release. |
 | 0.5.0 | Firmware updates over Bluetooth from the app. |
