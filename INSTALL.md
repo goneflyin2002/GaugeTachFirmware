@@ -53,8 +53,16 @@ several hundred volts, so it must **never** connect directly to the board.
                         │                                            │
  GND  ──────────────────┴────────────────────────────────────────────┘
 
- PC817 output:  collector (pin 4) → D10      emitter (pin 3) → GND
-                (D10 has an internal pull-up; add 4.7–10 kΩ to 3.3 V for extra margin)
+ PC817 output, at the board:
+
+   3.3 V ──[4.7 kΩ]──┬──────────── D10
+                     │         │
+        collector (pin 4)   [2.2 nF]
+                     │         │
+   GND ── emitter (pin 3) ─────┴── GND
+
+ Fit the pull-up and capacitor right at the D10 pin. No series resistor
+ between the PC817 and D10: it would stop the pin being pulled cleanly low.
 ```
 
 - Use a **shielded or twisted pair** for the tach wire, and route it **away
@@ -68,18 +76,24 @@ several hundred volts, so it must **never** connect directly to the board.
 Lets the needle drop to 0 straight away when the key is turned off.
 
 ```
- 12 V ignition (key on) ──[2.2 kΩ]──┬── D9
-                                    │
-                                 [560 Ω] ‖ [100 nF]
-                                    │
- GND ───────────────────────────────┘
+ 12 V ignition (key on) ──[10 kΩ]──┬──────────── D9
+                                   │       │
+                          [4.7 kΩ] ‖ [100 nF]   Schottky (BAT54 / 1N5819)
+                                   │       └──►|── 3.3 V   (cathode to 3.3 V)
+ GND ──────────────────────────────┘
 ```
+
+Take the 12 V for this from the **ignition side** of the gauge's supply diode,
+so the supercapacitor can't hold D9 up after the key is turned off.
 
 - Use a feed that is only live with the key on. If possible, choose one that
   **stays live in START**.
-- D9 sees about 2.4–2.9 V with the key on. Battery sag while cranking can make
-  it read "off", but the gauge only parks once sparks have also stopped, so it
-  can't park with the engine running.
+- D9 reads solidly ON from about 8 V up; the diode keeps it under the pin's
+  limit at charging voltage and during spikes.
+- The earlier 2.2 kΩ / 560 Ω divider also works, but at 12 V it sits right at
+  the logic threshold. The firmware copes (it waits for the sparks to stop, or
+  1.5 s), but the 10 kΩ / 4.7 kΩ version removes any chance of a false park
+  on a running car with low battery voltage.
 - In the app, turn on **Setup → Ignition → Park needle when ignition turns off**.
 
 ---
@@ -124,7 +138,8 @@ Lets the needle drop to 0 straight away when the key is turned off.
 
 | Symptom | Likely cause / fix |
 |---|---|
-| Needle twitches, or reads high at idle | Ignition noise on the tach wire: re-route it away from the HT leads, check the ground, use shielded wire. Lower **Ignore pulses above** (e.g. 8000). |
+| Needle twitches, or reads high at idle | Ignition noise on the tach wire. Watch **Noise pulses rejected** on the app's Live tab (or type `tach`): if it climbs, re-route the wire away from the HT leads, check the ground and the 2.2 nF capacitor at D10, use shielded wire. Lowering **Ignore pulses above** (e.g. 8000) also helps. |
+| Reads a steady 2× | A fake edge on *every* cycle (ringing on the signal's other edge). Check the 2.2 nF capacitor at D10, and that the tach wire is on the right terminal. |
 | Reads exactly 2× or ½× | Wrong cylinder / pulses-per-rev setting. |
 | No reading at all | Tach wire on the wrong terminal (MSD: use the tach output), optocoupler polarity, or the 1N4148 fitted the wrong way round. |
 | Needle doesn't return exactly to 0 | Steps lost: lower Top speed / Acceleration, then re-run the 10-sweep test. |
