@@ -1,6 +1,6 @@
 {
-  "version": "0.7.3",
-  "url": "https://raw.githubusercontent.com/goneflyin2002/GaugeTachFirmware/main/releases/GaugeTach_v0.7.3.bin",
-  "size": 845200,
-  "notes": "Added multilayer glitch filters again, again."
+  "version": "0.7.4",
+  "url": "https://raw.githubusercontent.com/goneflyin2002/GaugeTachFirmware/main/releases/GaugeTach_v0.7.4.bin",
+  "size": 829056,
+  "notes": "Key off behaviours updated- D9 input."
 }
