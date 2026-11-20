@@ -90,10 +90,12 @@ so the supercapacitor can't hold D9 up after the key is turned off.
   **stays live in START**.
 - D9 reads solidly ON from about 8 V up; the diode keeps it under the pin's
   limit at charging voltage and during spikes.
-- The earlier 2.2 kΩ / 560 Ω divider also works, but at 12 V it sits right at
-  the logic threshold. The firmware copes (it waits for the sparks to stop, or
-  1.5 s), but the 10 kΩ / 4.7 kΩ version removes any chance of a false park
-  on a running car with low battery voltage.
+- The gauge parks 0.1 s after D9 drops, so D9 must not drop while the engine
+  runs. The earlier 2.2 kΩ / 560 Ω divider sits right at the logic threshold
+  at 12 V: battery sag while cranking, or a low battery while running, can
+  park the needle until the voltage recovers. Use the 10 kΩ / 4.7 kΩ version.
+- Supercapacitor: 0.33 F on the 5 V side is borderline; 1 F gives plenty of
+  margin for the needle to reach zero after key-off.
 - In the app, turn on **Setup → Ignition → Park needle when ignition turns off**.
 
 ---
