@@ -5,7 +5,7 @@ Bluetooth. The first gauge is a 0–7000 RPM tachometer with a 345° sweep for a
 Cobra; the same firmware and app are meant to grow into a universal gauge kit.
 
 - **App:** [gauge_app](https://github.com/goneflyin2002/gauge_app) (Flutter, Android)
-- **Current version:** 0.7.1
+- **Current version:** 0.7.3
 - **Installing in a car:** see [INSTALL.md](INSTALL.md)
 
 ---
@@ -40,8 +40,9 @@ resistor** (it would stop the PC817 pulling D10 cleanly low). The capacitor
 stops edge ringing and interference from being counted as pulses.
 Never connect coil negative directly to the board.
 
-The firmware adds more layers on top: a check that each edge settles LOW
-(sampled every 20 µs for up to 100 µs), a max-RPM lockout, rejection of
+The firmware adds more layers on top: a check that each edge stays LOW for
+at least 5 µs in total within 100 µs (rejects sub-microsecond ringing, passes
+weak low-RPM sparks), a max-RPM lockout, rejection of
 intervals far shorter than the recent typical one, treating a ~2× interval as
 a missed pulse, and a reading that ignores the 2 highest and 2 lowest of the
 last 8 intervals. The ESP32-C5's hardware glitch filter is available but off
@@ -49,14 +50,17 @@ last 8 intervals. The ESP32-C5's hardware glitch filter is available but off
 pulses are counted (`tach`, and in the app's Live tab) so you can see whether
 noise is getting in.
 
-**Ignition sense (D9, optional):** 12 V ignition (switched) → 2.2 kΩ → D9,
-with 560 Ω from D9 to ground (about 2.4–2.9 V at D9 with the key on). A
-100 nF capacitor across the 560 Ω filters noise. With "Park needle when
-ignition turns off" enabled in the app, turning the key off drives the needle
-to 0 and switches the coils off while the supercapacitor keeps the gauge
-alive. It only parks once sparks have stopped too, so battery sag while
-cranking can't trigger it. Use an ignition feed that stays on in START if you
-can.
+**Ignition sense (D9, optional):** 12 V ignition (switched) → **10 kΩ** →
+D9, with **4.7 kΩ** from D9 to ground, a **Schottky diode from D9 to 3.3 V**
+(BAT54 or 1N5819, cathode to 3.3 V) as a clamp, and 100 nF across the 4.7 kΩ.
+D9 then reads solidly ON from about 8 V up, so cranking sag can't make it read
+"off". (The earlier 2.2 kΩ / 560 Ω divider works, but sits only just above the
+logic threshold at 12 V.) Take the sense from the ignition side of the supply
+diode, so the supercapacitor can't hold it up. With "Park needle when ignition
+turns off" enabled in the app, turning the key off drives the needle to 0 and
+switches the coils off while the supercapacitor keeps the gauge alive. It
+parks within 0.1 s once sparks stop, or after 1.5 s if the coil keeps firing
+(e.g. on a test stand). Use an ignition feed that stays on in START if you can.
 
 To drive the X27 straight from the GPIO pins instead (3.3 V, less torque),
 set `USE_TB6612 = false` at the top of the sketch.
@@ -92,6 +96,8 @@ the app can.
 | `mon` | Toggle live readout (includes the rejected-pulse count) |
 | `tach` / `tach reset` | Tach edge count, rejects by type, layer states / clear counters |
 | `tach hw\|confirm\|adaptive on\|off` | Switch a tach filter layer for testing (not saved) |
+| `tach width <µs>` | Minimum total LOW time for a real pulse (default 5, not saved) |
+| `tach scan on\|off` / `tach widths` | Measure every pulse's LOW time / show the histogram |
 | `rpm <n>` / `live` | Simulate an input / back to the real signal |
 | `sweep [n]` | Sweep 0 → full → 0, n times |
 | `home` | Re-zero against the stop |
@@ -146,6 +152,8 @@ The first OTA-capable firmware (0.5.0) has to be flashed over USB once.
 
 | Version | Summary |
 |---|---|
+| 0.7.3 | Parks the needle 1.5 s after ignition-off even if the coil keeps firing (test stands). Start-up learning requires the first intervals to agree, so a missed first spark can't set a half-RPM baseline. Signal quality (Good / Noisy / Bad) for the app; fixes the edges/s spike after `tach reset`. |
+| 0.7.2 | Fixes half-RPM readings at low speed with points: the edge check now measures total LOW time (5 µs minimum) instead of needing ~40 µs, so weak low-RPM sparks count. Pulse-width histogram for tuning. |
 | 0.7.1 | Fixes 0.7.0 tach dropouts: hardware glitch filter off by default, edge check samples up to 100 µs (slow optocoupler edges pass), missed pulses no longer dip the needle, layer on/off switches and edges/s in `mon`. |
 | 0.7.0 | Tach input noise protection: hardware glitch filter, edge confirmation, adaptive interval rejection, trimmed 2-revolution reading, noise counters. Fixes erratic readings from edge ringing at low RPM. |
 | 0.6.0 | Ignition sense on D9: needle parks at 0 when the key is turned off (switch in the app). |
