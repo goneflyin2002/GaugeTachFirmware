@@ -5,7 +5,7 @@ Bluetooth. The first gauge is a 0–7000 RPM tachometer with a 345° sweep for a
 Cobra; the same firmware and app are meant to grow into a universal gauge kit.
 
 - **App:** [gauge_app](https://github.com/goneflyin2002/gauge_app) (Flutter, Android)
-- **Current version:** 0.7.3
+- **Current version:** 0.7.4
 - **Installing in a car:** see [INSTALL.md](INSTALL.md)
 
 ---
@@ -59,8 +59,12 @@ logic threshold at 12 V.) Take the sense from the ignition side of the supply
 diode, so the supercapacitor can't hold it up. With "Park needle when ignition
 turns off" enabled in the app, turning the key off drives the needle to 0 and
 switches the coils off while the supercapacitor keeps the gauge alive. It
-parks within 0.1 s once sparks stop, or after 1.5 s if the coil keeps firing
-(e.g. on a test stand). Use an ignition feed that stays on in START if you can.
+parks 0.1 s after D9 drops, at twice the normal needle speed, with Bluetooth
+and serial output switched off to save the supercap (the app disconnects;
+reconnect after key-on). A quick key-on before the supercap runs out re-homes
+the needle. Use an ignition feed that stays on in START if you can. The fast
+0.1 s response relies on the 10k / 4.7k divider: on the older 2.2k / 560 one,
+battery sag can park the needle until the voltage recovers.
 
 To drive the X27 straight from the GPIO pins instead (3.3 V, less torque),
 set `USE_TB6612 = false` at the top of the sketch.
@@ -152,6 +156,7 @@ The first OTA-capable firmware (0.5.0) has to be flashed over USB once.
 
 | Version | Summary |
 |---|---|
+| 0.7.4 | Parks 0.1 s after ignition-off (needs the 10k / 4.7k D9 divider), at 2x needle speed, with Bluetooth and serial switched off during the park to stretch the supercap. Quick key-on re-homes. |
 | 0.7.3 | Parks the needle 1.5 s after ignition-off even if the coil keeps firing (test stands). Start-up learning requires the first intervals to agree, so a missed first spark can't set a half-RPM baseline. Signal quality (Good / Noisy / Bad) for the app; fixes the edges/s spike after `tach reset`. |
 | 0.7.2 | Fixes half-RPM readings at low speed with points: the edge check now measures total LOW time (5 µs minimum) instead of needing ~40 µs, so weak low-RPM sparks count. Pulse-width histogram for tuning. |
 | 0.7.1 | Fixes 0.7.0 tach dropouts: hardware glitch filter off by default, edge check samples up to 100 µs (slow optocoupler edges pass), missed pulses no longer dip the needle, layer on/off switches and edges/s in `mon`. |
