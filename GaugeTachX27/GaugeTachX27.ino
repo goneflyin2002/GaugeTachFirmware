@@ -33,7 +33,7 @@
 #include <BLE2902.h>          // NimBLE (ESP32-C5) adds this descriptor automatically
 #endif
 
-#define FW_VERSION "0.7.1"
+#define FW_VERSION "0.7.3"
 // Releases: bump FW_VERSION, Sketch > Export Compiled Binary, publish the .bin
 // and version.json in the GaugeTachFirmware repo (see its README).
 // Tools > Partition Scheme must stay "8M with spiffs (3MB APP/1.5MB SPIFFS)":
@@ -398,11 +398,12 @@ bool homeNeedle() {
 //   2. ESP32-C5 hardware glitch filter (1.3 us). OFF by default: in 0.7.0
 //      it silently swallowed real edges from the slow optocoupler output.
 //      "tach hw on" to experiment.
-//   3. Edge confirmation: after a falling edge the pin is sampled every
-//      20 us for up to 100 us; the edge counts once it reads LOW twice in a
-//      row. Kills ringing on the RISING edge (which otherwise looks like a
-//      falling edge), while slow, wobbly real edges through the optocoupler
-//      still pass. (0.7.0 used one look at 20 us, which rejected those.)
+//   3. Edge confirmation: after a falling edge, add up how long the pin is
+//      actually LOW over the next 100 us; it counts once that reaches 5 us.
+//      Kills ringing on the RISING edge (sub-microsecond dips that look like
+//      falling edges), while short real pulses (weak sparks at low RPM) and
+//      slow, wobbly optocoupler edges pass. (0.7.1 needed ~40 us LOW, which
+//      dropped alternate low-RPM pulses from points and read half.)
 //   4. Fixed lockout: nothing faster than "ignore pulses above" RPM.
 //   5. Adaptive rejection: an interval under 60% of the recent typical
 //      (median) interval is a glitch; an engine can't halve its pulse
@@ -423,8 +424,10 @@ bool homeNeedle() {
 // ------------------------------------------------------------------
 portMUX_TYPE tachMux = portMUX_INITIALIZER_UNLOCKED;
 constexpr uint32_t TACH_TIMEOUT_US = 400000;   // no pulse for 0.4 s = engine stopped
-constexpr uint32_t TACH_CONFIRM_STEP_US = 20;  // layer 3: sample spacing
-constexpr uint8_t  TACH_CONFIRM_STEPS   = 5;   // layer 3: up to 100 us
+constexpr uint32_t TACH_CONFIRM_WINDOW_US = 100; // layer 3: look at the pin for up to 100 us
+volatile uint8_t  tachMinLowUs  = 5;           // layer 3: real pulses are LOW at least this long in total
+volatile bool     tachWidthScan = false;       // "tach scan on": measure every edge's full LOW time
+volatile uint32_t tachWidthHist[8];            // <2, 2-5, 5-10, 10-20, 20-40, 40-70, 70-100, 100+ us
 constexpr float    TACH_SHORT_FRAC = 0.60f;    // layer 5
 volatile uint32_t t_minPerUs = 1000;           // layer 4, from maxInputRpm
 
@@ -448,7 +451,8 @@ volatile uint8_t  t_splitRun = 0;              // consecutive ~2x intervals (mis
 volatile uint32_t tachRejGlitch = 0;           // failed edge confirmation (layer 3)
 volatile uint32_t tachRejLock   = 0;           // faster than max RPM (layer 4)
 volatile uint32_t tachRejShort  = 0;           // held back as too short (layer 5)
-volatile uint32_t tachResyncs   = 0;           // accepted a new, faster rhythm (layer 5)
+volatile uint32_t tachResyncs   = 0;           // switched to a new pace (layer 5)
+volatile uint32_t tachAccepted  = 0;           // sparks counted (for the signal-quality figure)
 
 // a within 25% of b
 static inline bool similarIv(uint32_t a, uint32_t b) {
@@ -491,6 +495,7 @@ void tachProcessEdge(uint32_t now) {
 
   if (p >= TACH_TIMEOUT_US) {                              // first pulse after a stop
     t_lastUs = now; t_count = 0; t_streak = 0;
+    tachAccepted = tachAccepted + 1;
     return;
   }
 
@@ -507,6 +512,7 @@ void tachProcessEdge(uint32_t now) {
         for (uint8_t i = 0; i < 3; i++) tachStore(t_streakIv[i]);
         t_lastUs = now;
         t_streak = 0;
+        tachAccepted = tachAccepted + 1;
       } else {
         tachRejShort = tachRejShort + 1;
       }
@@ -525,6 +531,15 @@ void tachProcessEdge(uint32_t now) {
   }
 
   t_lastUs = now;
+  tachAccepted = tachAccepted + 1;
+  // Start-up learning: the first 3 intervals decide what "normal" is, so
+  // they must agree within 30%. If one doesn't (e.g. a weak first spark was
+  // missed and one interval is double), start learning again from here
+  // instead of locking in half the RPM.
+  if (t_count > 0 && t_count < 3) {
+    uint32_t last = t_per[(t_idx - 1) & 7];
+    if (!(p * 10 > last * 7 && p * 10 < last * 13)) t_count = 0;
+  }
   // An interval ~2x the typical one is a missed pulse (an engine can't halve
   // its speed between two sparks): store it as two normal intervals.
   // 3 in a row means the speed really did halve (e.g. a signal generator):
@@ -577,13 +592,29 @@ void ARDUINO_ISR_ATTR onTachEdge() {
   uint32_t now = micros();
   tachIsrCount = tachIsrCount + 1;
   if (tachConfirmOn) {                                     // layer 3
-    // Accept once the pin reads LOW twice in a row; give up after 100 us.
-    uint8_t lows = 0;
-    for (uint8_t i = 0; i < TACH_CONFIRM_STEPS && lows < 2; i++) {
-      delayMicroseconds(TACH_CONFIRM_STEP_US);
-      lows = (digitalRead(PIN_TACH) == LOW) ? lows + 1 : 0;
+    // Add up how long the pin is actually LOW over the next 100 us, wobbles
+    // and all. A real pulse, even a weak one at low RPM, totals several us;
+    // ringing on the other edge is sub-microsecond dips. Accept as soon as
+    // the total reaches tachMinLowUs (unless scanning, which measures it all).
+    bool scan = tachWidthScan;
+    uint8_t need = tachMinLowUs;
+    uint32_t lowUs = 0, t = now;
+    bool ok = need == 0;
+    while (true) {
+      bool low = digitalRead(PIN_TACH) == LOW;
+      uint32_t t2 = micros();
+      if (low) lowUs += t2 - t;
+      t = t2;
+      if (!ok && lowUs >= need) { ok = true; if (!scan) break; }
+      if (t2 - now >= TACH_CONFIRM_WINDOW_US) break;
     }
-    if (lows < 2) { tachRejGlitch = tachRejGlitch + 1; return; }
+    if (scan) {
+      static const uint8_t edges[7] = { 2, 5, 10, 20, 40, 70, 100 };
+      uint8_t b = 0;
+      while (b < 7 && lowUs >= edges[b]) b++;
+      tachWidthHist[b] = tachWidthHist[b] + 1;
+    }
+    if (!ok) { tachRejGlitch = tachRejGlitch + 1; return; }
   }
   portENTER_CRITICAL_ISR(&tachMux);
   tachProcessEdge(now);
@@ -656,6 +687,28 @@ float measureRpm() {
 // mostly the same edge triggering twice on a slow signal, so not counted here.)
 uint32_t tachRejectedTotal() {
   return tachRejGlitch + tachRejShort;
+}
+
+// Signal quality for the app, every 2 s: 0 no signal, 1 good, 2 noisy, 3 bad.
+// Judged by edges held back as "too short" per real spark (points closing
+// bounce alone is ~10-15%: good) and by resyncs (the filter had to change its
+// mind). Glitches and repeat triggers on one spark are normal with points,
+// so they don't count against it.
+volatile uint8_t tachSignal = 0;
+
+void tachSignalUpdate() {
+  static uint32_t lastMs = 0, lastAcc = 0, lastShort = 0, lastResync = 0;
+  uint32_t nowMs = millis();
+  if (nowMs - lastMs < 2000) return;
+  lastMs = nowMs;
+  uint32_t acc = tachAccepted, sh = tachRejShort, rs = tachResyncs;
+  uint32_t dAcc = acc - lastAcc, dShort = sh - lastShort, dRs = rs - lastResync;
+  if (acc < lastAcc || sh < lastShort || rs < lastResync) { dAcc = dShort = dRs = 0; }  // after 'tach reset'
+  lastAcc = acc; lastShort = sh; lastResync = rs;
+  if (dAcc < 4)                 tachSignal = 0;   // engine stopped / no input
+  else if (dShort * 10 > dAcc * 6) tachSignal = 3; // more than 60% extra edges
+  else if (dShort * 4 > dAcc || dRs > 0) tachSignal = 2;
+  else                          tachSignal = 1;
 }
 
 // ------------------------------------------------------------------
@@ -733,6 +786,8 @@ void printHelp() {
     "  mon                   toggle live readout\n"
     "  tach | tach reset     tach input counters and layer states / clear counters\n"
     "  tach hw|confirm|adaptive on|off   switch a tach filter layer (testing)\n"
+    "  tach width <us>       min total LOW time for a real pulse (default 5)\n"
+    "  tach scan on|off      measure every pulse's LOW time; 'tach widths' shows them\n"
     "  rpm <n>               simulate input (e.g. rpm 3000)\n"
     "  live                  back to real input\n"
     "  sweep [n]             sweep 0 -> full -> 0 (n times; step-loss test)\n"
@@ -805,13 +860,27 @@ void handleLine(char* line) {
     bool on = a2 && !strcmp(a2, "on");
     bool valid = a2 && (on || !strcmp(a2, "off"));
     if (a1 && !strcmp(a1, "reset")) {
-      tachRejGlitch = 0; tachRejLock = 0; tachRejShort = 0; tachResyncs = 0; tachIsrCount = 0;
+      tachRejGlitch = 0; tachRejLock = 0; tachRejShort = 0; tachResyncs = 0; tachIsrCount = 0; tachAccepted = 0;
       Serial.println(F("Tach counters cleared."));
     } else if (a1 && !strcmp(a1, "hw") && valid) {
       if (!tachHwSet(on)) Serial.println(F("Hardware glitch filter not available."));
       printTachStats();
     } else if (a1 && !strcmp(a1, "confirm") && valid) {
       tachConfirmOn = on; printTachStats();
+    } else if (a1 && !strcmp(a1, "width") && a2) {
+      tachMinLowUs = (uint8_t)constrain(atoi(a2), 0, 90);
+      printTachStats();
+    } else if (a1 && !strcmp(a1, "scan") && valid) {
+      for (int i = 0; i < 8; i++) tachWidthHist[i] = 0;
+      tachWidthScan = on;
+      Serial.println(on ? F("Measuring pulse widths. Type 'tach widths' to see them.")
+                        : F("Pulse width measuring off."));
+    } else if (a1 && !strcmp(a1, "widths")) {
+      static const char* const names[8] = { " <2", "2-5", "5-10", "10-20", "20-40", "40-70", "70-100", "100+" };
+      Serial.printf("LOW time per edge (us), threshold %u%s:\n", tachMinLowUs,
+                    tachWidthScan ? "" : "  (scan is off: 'tach scan on' first)");
+      for (int i = 0; i < 8; i++)
+        Serial.printf("  %-7s %lu\n", names[i], (unsigned long)tachWidthHist[i]);
     } else if (a1 && !strcmp(a1, "adaptive") && valid) {
       tachAdaptiveOn = on; printTachStats();
     } else printTachStats();
@@ -877,7 +946,7 @@ void printMonitor() {
   uint32_t nowMs = millis();
   if (!monitorOn || nowMs - lastMs < 250) return;
   uint32_t isr = tachIsrCount;
-  uint32_t edgesPerSec = (uint32_t)((isr - lastIsr) * 1000UL / (nowMs - lastMs));
+  uint32_t edgesPerSec = isr >= lastIsr ? (uint32_t)((isr - lastIsr) * 1000UL / (nowMs - lastMs)) : 0;  // 0 just after 'tach reset'
   lastMs = nowMs; lastIsr = isr;
   Serial.printf("%s rpm %5.0f (raw %5.0f)  needle %6.2f deg  target %6.2f  v %6.0f deg/s  edges/s %4lu  rej %lu\n",
                 simRpm >= 0 ? "SIM " : "LIVE", rpmFilt, rpmRaw,
@@ -886,13 +955,16 @@ void printMonitor() {
 }
 
 void printTachStats() {
-  Serial.printf("Tach edges seen %lu | rejected: glitch %lu | too fast %lu | too short %lu | resyncs %lu\n",
-                (unsigned long)tachIsrCount, (unsigned long)tachRejGlitch, (unsigned long)tachRejLock,
-                (unsigned long)tachRejShort, (unsigned long)tachResyncs);
-  Serial.printf("Layers: hw filter %s | confirm %s | adaptive %s\n",
-                tachHwOn ? "ON" : "off", tachConfirmOn ? "ON" : "off", tachAdaptiveOn ? "ON" : "off");
+  static const char* const sigNames[4] = { "no signal", "GOOD", "NOISY", "BAD" };
+  Serial.printf("Tach edges seen %lu | sparks %lu | rejected: glitch %lu | too fast %lu | too short %lu | resyncs %lu | signal %s\n",
+                (unsigned long)tachIsrCount, (unsigned long)tachAccepted, (unsigned long)tachRejGlitch,
+                (unsigned long)tachRejLock, (unsigned long)tachRejShort, (unsigned long)tachResyncs,
+                sigNames[tachSignal & 3]);
+  Serial.printf("Layers: hw filter %s | confirm %s (min LOW %u us) | adaptive %s\n",
+                tachHwOn ? "ON" : "off", tachConfirmOn ? "ON" : "off", tachMinLowUs,
+                tachAdaptiveOn ? "ON" : "off");
   Serial.println(F("  edges seen = every interrupt, before any filtering"));
-  Serial.println(F("  glitch = didn't settle LOW within 100 us (ringing / noise)"));
+  Serial.println(F("  glitch = LOW for less than the min time within 100 us (ringing / noise)"));
   Serial.println(F("  too fast = faster than 'ignore pulses above' (often one slow edge triggering twice)"));
   Serial.println(F("  too short = much shorter than the recent typical interval"));
 }
@@ -1071,11 +1143,11 @@ void bleStatusTask(void*) {
     int n = snprintf(b, sizeof(b),
       "{\"rpm\":%.0f,\"raw\":%.0f,\"needle\":%.2f,\"target\":%.2f,\"homed\":%u,\"busy\":%u,"
       "\"hold\":%u,\"sim\":%d,\"unsaved\":%u,\"rev\":%lu,\"ota\":%u,\"otapct\":%u,\"otaerr\":\"%s\","
-      "\"ignon\":%u,\"parked\":%u,\"rej\":%lu}",
+      "\"ignon\":%u,\"parked\":%u,\"rej\":%lu,\"sig\":%u}",
       (float)rpmFilt, (float)rpmRaw, (float)mPos, (float)mTarget, homed ? 1 : 0, busy ? 1 : 0,
       manualHold ? 1 : 0, simRpm >= 0 ? (int)simRpm : -1, cfgUnsaved ? 1 : 0, (unsigned long)cfgRev,
       (unsigned)otaState, otaPct, otaErr, ignOn ? 1 : 0, parked ? 1 : 0,
-      (unsigned long)tachRejectedTotal());
+      (unsigned long)tachRejectedTotal(), (unsigned)tachSignal);
     statusChar->setValue((uint8_t*)b, n);
     statusChar->notify();
   }
@@ -1131,14 +1203,18 @@ void pollBle() {
 //  0 V with it off. The supercap keeps the gauge alive for a few seconds,
 //  long enough to drive the needle home and switch the coils off.
 //
-//  To avoid parking by mistake (battery sag while cranking can pull D9
-//  below the logic threshold), it parks only when D9 has been LOW for
-//  100 ms AND no spark has arrived for 100 ms. With the key off there's no
-//  spark, so this costs nothing; with the engine running it can't trigger.
+//  Parks when D9 has been LOW for 100 ms AND either no spark has arrived
+//  for 100 ms (a real key-off: instant) OR D9 has stayed LOW for 1.5 s
+//  (ignition sense off but the coil still firing, e.g. on a test stand).
+//  The spark check avoids a false park when battery sag while cranking pulls
+//  the 2.2k / 560 divider below the logic threshold. With the improved
+//  divider (10k / 4.7k + Schottky clamp to 3.3 V), D9 stays solidly HIGH
+//  down to about 8 V, so that can't happen.
 // ------------------------------------------------------------------
 constexpr uint32_t IGN_OFF_MS      = 100;   // D9 low this long = key off
 constexpr uint32_t IGN_ON_MS       = 300;   // D9 high this long = key back on
 constexpr uint32_t IGN_QUIET_US    = 100000;// no spark for 100 ms
+constexpr uint32_t IGN_FORCE_MS    = 1500;  // or D9 off this long, sparks or not
 constexpr uint32_t PARK_TIMEOUT_MS = 4000;  // coils off by now, no matter what
 
 uint32_t parkStartMs = 0;
@@ -1164,10 +1240,10 @@ void unparkNeedle() {
 }
 
 void ignitionUpdate() {
-  static uint32_t lastHighMs = 0, lastLowMs = 0;
+  static uint32_t lastHighMs = 0, lastLowMs = 0, offSinceMs = 0;
   uint32_t now = millis();
   if (digitalRead(PIN_IGN) == HIGH) lastHighMs = now; else lastLowMs = now;
-  if (ignOn  && now - lastHighMs >= IGN_OFF_MS) ignOn = false;
+  if (ignOn  && now - lastHighMs >= IGN_OFF_MS) { ignOn = false; offSinceMs = now; }
   if (!ignOn && now - lastLowMs  >= IGN_ON_MS)  ignOn = true;
 
   if (!cfg.ignSense) {                           // feature switched off in the app
@@ -1177,7 +1253,8 @@ void ignitionUpdate() {
 
   if (!parked) {
     bool sparkQuiet = (uint32_t)(micros() - t_lastUs) > IGN_QUIET_US;
-    if (!ignOn && sparkQuiet && homed && !busy && otaState == 0) parkNeedle();
+    bool offLong    = !ignOn && now - offSinceMs >= IGN_FORCE_MS;
+    if (!ignOn && (sparkQuiet || offLong) && homed && !busy && otaState == 0) parkNeedle();
     return;
   }
 
@@ -1241,6 +1318,7 @@ void loop() {
   pollSerial();
   pollBle();
   ignitionUpdate();
+  tachSignalUpdate();
   printMonitor();
   if (otaState == 2 && (int32_t)(millis() - otaRebootAt) >= 0) {
     Serial.println(F("Firmware updated, restarting."));
